@@ -1,5 +1,7 @@
 activeLambdaJavaProxies = set()
 
+from numbers import Integral
+
 cdef jstringy_arg(argtype):
     return argtype in ('Ljava/lang/String;',
                        'Ljava/lang/CharSequence;',
@@ -38,7 +40,6 @@ cdef void populate_args(JNIEnv *j_env, tuple definition_args, jvalue *j_args, ar
     cdef JavaClass jc
     cdef PythonJavaClass pc
     cdef int index
-    from ctypes import c_long as long
 
     for index, argtype in enumerate(definition_args):
         py_arg = args[index]
@@ -63,7 +64,7 @@ cdef void populate_args(JNIEnv *j_env, tuple definition_args, jvalue *j_args, ar
                 j_args[index].l = NULL
 
             # numeric types
-            elif isinstance(py_arg, (int, long)):
+            if isinstance(py_arg, Integral):
                 j_args[index].l = convert_python_to_jobject(
                     j_env, 'Ljava/lang/Integer;', py_arg
                 )
@@ -468,7 +469,6 @@ cdef jobject convert_python_to_jobject(JNIEnv *j_env, definition, obj) except *:
     cdef JavaClassStorage jcs
     cdef PythonJavaClass pc
     cdef int index
-    from ctypes import c_long as long
 
     if definition[0] == 'V':
         return NULL
@@ -481,12 +481,13 @@ cdef jobject convert_python_to_jobject(JNIEnv *j_env, definition, obj) except *:
             return convert_pystr_to_java(j_env, to_unicode(obj))
 
         # numeric types
-        elif isinstance(obj, (int, long)) and \
-                definition in (
-                    'Ljava/lang/Integer;',
-                    'Ljava/lang/Number;',
-                    'Ljava/lang/Long;',
-                    'Ljava/lang/Object;'):
+        elif isinstance(obj, Integral) and \
+                        definition in (
+                            'Ljava/lang/Integer;',
+                            'Ljava/lang/Number;',
+                            'Ljava/lang/Long;',
+                            'Ljava/lang/Object;'):
+
             j_ret[0].i = int(obj)
             retclass = j_env[0].FindClass(j_env, 'java/lang/Integer')
             retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(I)V')
@@ -634,7 +635,6 @@ cdef jobject convert_pyarray_to_java(JNIEnv *j_env, definition, pyarray) except 
     cdef jclass j_class
     cdef JavaObject jo
     cdef JavaClass jc
-    from ctypes import c_long as long
 
     cdef ByteArray a_bytes
 
