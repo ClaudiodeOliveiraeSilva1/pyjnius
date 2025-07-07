@@ -1,532 +1,506 @@
-cdef str_for_c(s):
-    return s.encode('utf-8')
+activeLambdaJavaProxies = set()
 
-cdef parse_definition(definition):
-    # not a function, just a field
-    if definition[0] != '(':
-        return definition, None
+cdef jstringy_arg(argtype):
+    return argtype in ('Ljava/lang/String;',
+                       'Ljava/lang/CharSequence;',
+                       'Ljava/lang/Object;')
 
-    # it's a function!
-    argdef, ret = definition[1:].split(')')
-    args = []
-
-    while len(argdef):
-        c = argdef[0]
-
-        # read the array char(s)
-        prefix = ''
-        while c == '[':
-            prefix += c
-            argdef = argdef[1:]
-            c = argdef[0]
-
-        # native type
-        if c in 'ZBCSIJFD':
-            args.append(prefix + c)
-            argdef = argdef[1:]
-            continue
-
-        # java class
-        if c == 'L':
-            c, argdef = argdef.split(';', 1)
-            args.append(prefix + c + ';')
-            continue
-
-        raise Exception('Invalid "{}" character in definition "{}"'.format(
-            c, definition[1:]))
-
-    return ret, tuple(args)
-
-
-cdef void check_exception(JNIEnv *j_env) except *:
-    cdef jmethodID toString = NULL
-    cdef jmethodID getCause = NULL
-    cdef jmethodID getStackTrace = NULL
-    cdef jmethodID getMessage = NULL
-    cdef jstring e_msg
-    cdef jboolean isCopy
-    cdef jthrowable exc = j_env[0].ExceptionOccurred(j_env)
-    cdef jclass cls_object = NULL
-    cdef jclass cls_throwable = NULL
-    if exc:
-        # ExceptionDescribe always writes to stderr, preventing tidy exception
-        # handling, so should only be for debugging
-        # j_env[0].ExceptionDescribe(j_env)
-        j_env[0].ExceptionClear(j_env)
-
-        cls_object = j_env[0].FindClass(j_env, "java/lang/Object")
-        cls_throwable = j_env[0].FindClass(j_env, "java/lang/Throwable")
-
-        toString = j_env[0].GetMethodID(j_env, cls_object, "toString", "()Ljava/lang/String;");
-        getMessage = j_env[0].GetMethodID(j_env, cls_throwable, "getMessage", "()Ljava/lang/String;");
-        getCause = j_env[0].GetMethodID(j_env, cls_throwable, "getCause", "()Ljava/lang/Throwable;");
-        getStackTrace = j_env[0].GetMethodID(j_env, cls_throwable, "getStackTrace", "()[Ljava/lang/StackTraceElement;");
-
-        e_msg = j_env[0].CallObjectMethod(j_env, exc, getMessage);
-        pymsg = None if e_msg == NULL else convert_jstring_to_python(j_env, e_msg)
-
-        pystack = []
-        _append_exception_trace_messages(j_env, pystack, exc, getCause, getStackTrace, toString)
-
-        pyexcclass = lookup_java_object_name(j_env, exc).replace('/', '.')
-
-        j_env[0].DeleteLocalRef(j_env, cls_object)
-        j_env[0].DeleteLocalRef(j_env, cls_throwable)
-        if e_msg != NULL:
-            j_env[0].DeleteLocalRef(j_env, e_msg)
-        j_env[0].DeleteLocalRef(j_env, exc)
-
-        raise JavaException('JVM exception occurred: %s' % (str(pyexcclass) + ": " + pymsg if pymsg is not None else pyexcclass), pyexcclass, pymsg, pystack)
-
-
-cdef void _append_exception_trace_messages(
-    JNIEnv*      j_env,
-    list         pystack,
-    jthrowable   exc,
-    jmethodID    mid_getCause,
-    jmethodID    mid_getStackTrace,
-    jmethodID    mid_toString):
-
-    # Get the array of StackTraceElements.
-    cdef jobjectArray frames = j_env[0].CallObjectMethod(j_env, exc, mid_getStackTrace)
-    cdef jsize frames_length = j_env[0].GetArrayLength(j_env, frames)
-    cdef jstring msg_obj
-    cdef jobject frame
-    cdef jthrowable cause
-
-    # Add Throwable.toString() before descending stack trace messages.
-    if frames != NULL:
-        msg_obj = j_env[0].CallObjectMethod(j_env, exc, mid_toString)
-        pystr = None if msg_obj == NULL else convert_jobject_to_python(j_env, <bytes> 'Ljava/lang/String;', msg_obj)
-        # If this is not the top-of-the-trace then this is a cause.
-        if len(pystack) > 0:
-            pystack.append("Caused by:")
-        pystack.append(pystr)
-        if msg_obj != NULL:
-            j_env[0].DeleteLocalRef(j_env, msg_obj)
-
-    # Append stack trace messages if there are any.
-    if frames_length > 0:
-        for i in range(frames_length):
-            # Get the string returned from the 'toString()' method of the next frame and append it to the error message.
-            frame = j_env[0].GetObjectArrayElement(j_env, frames, i)
-            msg_obj = j_env[0].CallObjectMethod(j_env, frame, mid_toString)
-            pystr = None if msg_obj == NULL else convert_jobject_to_python(j_env, <bytes> 'Ljava/lang/String;', msg_obj)
-            pystack.append(pystr)
-            if msg_obj != NULL:
-                j_env[0].DeleteLocalRef(j_env, msg_obj)
-            j_env[0].DeleteLocalRef(j_env, frame)
-
-    # If 'exc' has a cause then append the stack trace messages from the cause.
-    if frames != NULL:
-        cause = j_env[0].CallObjectMethod(j_env, exc, mid_getCause)
-        if cause != NULL:
-            _append_exception_trace_messages(j_env, pystack, cause,
-                                             mid_getCause, mid_getStackTrace, mid_toString)
-            j_env[0].DeleteLocalRef(j_env, cause)
-
-    j_env[0].DeleteLocalRef(j_env, frames)
-
-cdef void check_assignable_from_str(JNIEnv *env, source, target) except *:
-    global assignable_from_order
-    cdef jclass cls, clsA, clsB
-    cdef jthrowable exc
-    # first call, we need to get over the libart issue, which implemented
-    # IsAssignableFrom the wrong way.
-    # Ref: https://github.com/kivy/pyjnius/issues/92
-    # Google Bug: https://android.googlesource.com/platform/art/+/1268b74%5E!/
-    if assignable_from_order == 0:
-        clsA = env[0].FindClass(env, "java/lang/String")
-        clsB = env[0].FindClass(env, "java/lang/Object")
-        if env[0].IsAssignableFrom(env, clsB, clsA):
-            # Bug triggered, IsAssignableFrom said we can do things like:
-            # String a = Object()
-            assignable_from_order = -1
-        else:
-            assignable_from_order = 1
-    
-    result = assignable_from.get((source, target), None)
-    if result is None:
-        # if we have a JavaObject, it's always ok.
-        if source == 'java/lang/Object':
-            return
-
-        # FIXME Android/libART specific check
-        # check_jni.cc crash when calling the IsAssignableFrom with
-        # org/jnius/NativeInvocationHandler java/lang/reflect/InvocationHandler
-        # Because we know it's ok, just return here.
-        if target == 'java/lang/reflect/InvocationHandler' and \
-            source == 'org/jnius/NativeInvocationHandler':
-            return
-
-        # if the signature is a direct match, it's ok too :)
-        if source == target:
-            return
-
-        s_source = str_for_c(source)
-        cls_source = env[0].FindClass(env, s_source)
-
-        if cls_source == NULL:
-            raise JavaException('Unable to find the class for {0!r}'.format(
-                source))
-
-        s_target = str_for_c(target)
-        cls_target = env[0].FindClass(env, s_target)
-
-        if cls_target == NULL:
-            raise JavaException('Unable to find the class for {0!r}'.format(
-                target))   
-
-        if assignable_from_order == 1:
-            result = bool(env[0].IsAssignableFrom(env, cls_source, cls_target))
-        else:
-            result = bool(env[0].IsAssignableFrom(env, cls_target, cls_source))
-
-        exc = env[0].ExceptionOccurred(env)
-        if exc:
-            env[0].ExceptionDescribe(env)
-            env[0].ExceptionClear(env)
-
-        assignable_from[(source, target)] = bool(result)
-    
-    if result is False:
-        raise TypeError('Invalid instance of {0!r} passed for a {1!r}'.format(
-            source, target))
-
-
-cdef dict assignable_from = {}
-cdef int assignable_from_order = 0
-cdef void check_assignable_from(JNIEnv *env, JavaClass jc, signature) except *:
-    global assignable_from_order
-    cdef jclass cls, clsA, clsB
-    cdef jthrowable exc
-
-    # first call, we need to get over the libart issue, which implemented
-    # IsAssignableFrom the wrong way.
-    # Ref: https://github.com/kivy/pyjnius/issues/92
-    # Google Bug: https://android.googlesource.com/platform/art/+/1268b74%5E!/
-    if assignable_from_order == 0:
-        clsA = env[0].FindClass(env, "java/lang/String")
-        clsB = env[0].FindClass(env, "java/lang/Object")
-        if env[0].IsAssignableFrom(env, clsB, clsA):
-            # Bug triggered, IsAssignableFrom said we can do things like:
-            # String a = Object()
-            assignable_from_order = -1
-        else:
-            assignable_from_order = 1
-
-    # if we have a JavaObject, it's always ok.
-    if signature == 'java/lang/Object':
-        return
-
-    # FIXME Android/libART specific check
-    # check_jni.cc crash when calling the IsAssignableFrom with
-    # org/jnius/NativeInvocationHandler java/lang/reflect/InvocationHandler
-    # Because we know it's ok, just return here.
-    if signature == 'java/lang/reflect/InvocationHandler' and \
-        jc.__javaclass__ == 'org/jnius/NativeInvocationHandler':
-        return
-
-    # if the signature is a direct match, it's ok too :)
-    if jc.__javaclass__ == signature:
-        return
-
-    # if we already did the test before, use the cache result!
-    result = assignable_from.get((jc.__javaclass__, signature), None)
-    if result is None:
-
-        # we got an object that doesn't match with the signature
-        # check if we can use it.
-        s = str_for_c(signature)
-        cls = env[0].FindClass(env, s)
-        if cls == NULL:
-            raise JavaException('Unable to found the class for {0!r}'.format(
-                signature))
-
-        if assignable_from_order == 1:
-            result = bool(env[0].IsAssignableFrom(env, jc.j_cls, cls))
-        else:
-            result = bool(env[0].IsAssignableFrom(env, cls, jc.j_cls))
-
-        exc = env[0].ExceptionOccurred(env)
-        if exc:
-            env[0].ExceptionDescribe(env)
-            env[0].ExceptionClear(env)
-
-        assignable_from[(jc.__javaclass__, signature)] = bool(result)
-
-    if result is False:
-        raise TypeError('Invalid instance of {0!r} passed for a {1!r}'.format(
-            jc.__javaclass__, signature))
-
-
-cdef lookup_java_object_name(JNIEnv *j_env, jobject j_obj):
-    cdef jclass jcls = j_env[0].GetObjectClass(j_env, j_obj)
-    cdef jclass jcls2 = j_env[0].GetObjectClass(j_env, jcls)
-    cdef jmethodID jmeth = j_env[0].GetMethodID(j_env, jcls2, 'getName', '()Ljava/lang/String;')
-    cdef jobject js = j_env[0].CallObjectMethod(j_env, jcls, jmeth)
-    name = convert_jobject_to_python(j_env, 'Ljava/lang/String;', js)
-    j_env[0].DeleteLocalRef(j_env, js)
-    j_env[0].DeleteLocalRef(j_env, jcls)
-    j_env[0].DeleteLocalRef(j_env, jcls2)
-    return name.replace('.', '/')
-
-
-cdef int calculate_score(sign_args, args, is_varargs=False) except *:
-    cdef int index
-    cdef int score = 0
+cdef void release_args(JNIEnv *j_env, tuple definition_args, pass_by_reference, jvalue *j_args, args) except *:
+    # do the conversion from a Python object to Java from a Java definition
+    cdef JavaObject jo
     cdef JavaClass jc
-    cdef int args_len = len(args)
-    cdef int sign_args_len = len(sign_args)
-    from ctypes import c_long as long
+    cdef int index
+    cdef int last_pass_by_ref_index
 
-    if args_len != sign_args_len and not is_varargs:
-        # if the number of arguments expected is not the same
-        # as the number of arguments the method gets
-        # it can not be the method we are looking for except
-        # if the method has varargs aka. it takes
-        # an undefined number of arguments
-        return -1
-    elif args_len == sign_args_len and not is_varargs:
-        # if the method has the good number of arguments and
-        # the method doesn't take varargs increment the score
-        # so that it takes precedence over a method with the same
-        # signature and varargs e.g.
-        # (Integer, Integer) takes precedence over (Integer, Integer, Integer...)
-        # and
-        # (Integer, Integer, Integer) takes precedence over (Integer, Integer, Integer...)
-        score += 10
+    last_pass_by_ref_index = len(pass_by_reference) - 1
 
-    for index in range(sign_args_len):
-        r = sign_args[index]
-        arg = args[index]
+    for index, argtype in enumerate(definition_args):
+        py_arg = args[index]
+        if argtype[0] == 'L':
+            if py_arg is None:
+                j_args[index].l = NULL
+            if isinstance(py_arg, basestring) and \
+                    jstringy_arg(argtype):
+                j_env[0].DeleteLocalRef(j_env, j_args[index].l)
+        elif argtype[0] == '[':
+            if pass_by_reference[min(index, last_pass_by_ref_index)] and hasattr(args[index], '__setitem__'):
+                ret = convert_jarray_to_python(j_env, argtype[1:], j_args[index].l)
+                try:
+                    args[index][:] = ret
+                except TypeError:
+                    pass
+            j_env[0].DeleteLocalRef(j_env, j_args[index].l)
 
-        if r == 'Z':
-            if not isinstance(arg, bool):
-                return -1
-            score += 10
-            continue
+cdef void populate_args(JNIEnv *j_env, tuple definition_args, jvalue *j_args, args) except *:
+    # do the conversion from a Python object to Java from a Java definition
+    cdef JavaClassStorage jcs
+    cdef JavaObject jo
+    cdef JavaClass jc
+    cdef PythonJavaClass pc
+    cdef int index
 
-        if r == 'B':
-            if not isinstance(arg, int):
-                return -1
-            score += 10
-            continue
+    for index, argtype in enumerate(definition_args):
+        py_arg = args[index]
+        if argtype == 'Z':
+            j_args[index].z = py_arg
+        elif argtype == 'B':
+            j_args[index].b = py_arg
+        elif argtype == 'C':
+            j_args[index].c = ord(py_arg)
+        elif argtype == 'S':
+            j_args[index].s = py_arg
+        elif argtype == 'I':
+            j_args[index].i = py_arg
+        elif argtype == 'J':
+            j_args[index].j = py_arg
+        elif argtype == 'F':
+            j_args[index].f = py_arg
+        elif argtype == 'D':
+            j_args[index].d = py_arg
+        elif argtype[0] == 'L':
+            if py_arg is None:
+                j_args[index].l = NULL
 
-        if r == 'C':
-            if not isinstance(arg, str) or len(arg) != 1:
-                return -1
-            score += 10
-            continue
+            # numeric types
+            elif isinstance(py_arg, int):
+                j_args[index].l = convert_python_to_jobject(
+                    j_env, 'Ljava/lang/Integer;', py_arg
+                )
+                check_assignable_from_str(j_env, 'java/lang/Integer', argtype[1:-1])
+            elif isinstance(py_arg, float):
+                j_args[index].l = convert_python_to_jobject(
+                    j_env, 'Ljava/lang/Float;', py_arg
+                )
+                check_assignable_from_str(j_env, 'java/lang/Float', argtype[1:-1])
+            # string types
+            elif isinstance(py_arg, base_string) and jstringy_arg(argtype):
+                j_args[index].l = convert_pystr_to_java(
+                    j_env, to_unicode(py_arg)
+                )
+                check_assignable_from_str(j_env, 'java/lang/String', argtype[1:-1])
+            elif isinstance(py_arg, JavaClass):
+                jc = py_arg
+                check_assignable_from(j_env, jc, argtype[1:-1])
+                j_args[index].l = jc.j_self.obj
 
-        if r == 'S' or r == 'I':
-            if isinstance(arg, int) or (
-                    (isinstance(arg, long) and arg < 2147483648)):
-                score += 10
-                continue
-            elif isinstance(arg, float):
-                score += 5
-                continue
+            # objects
+            elif isinstance(py_arg, JavaObject):
+                jo = py_arg
+                j_args[index].l = jo.obj
+            elif isinstance(py_arg, MetaJavaClass):
+                jcs = getattr(py_arg, CLS_STORAGE_NAME)
+                j_args[index].l = jcs.j_cls
+            elif isinstance(py_arg, PythonJavaClass):
+                # from python class, get the proxy/python class
+                pc = py_arg
+                # get the java class
+                jc = pc.j_self
+                if jc is None:
+                    pc._init_j_self_ptr()
+                    jc = pc.j_self
+                # get the localref
+                j_args[index].l = jc.j_self.obj
+
+            # implementation of Java class in Python (needs j_cls)
+            elif isinstance(py_arg, type):
+                jc = py_arg
+                j_args[index].l = jc.j_cls
+
+            # array
+            elif isinstance(py_arg, (tuple, list)):
+                j_args[index].l = convert_pyarray_to_java(j_env, argtype, py_arg)
+
+            # lambda or function
+            elif callable(py_arg):
+                
+                # we need to make a java object in python
+                py_arg = convert_python_callable_to_jobject(argtype, py_arg)
+
+                # TODO: this line should not be needed to prevent py_arg from being GCd 
+                activeLambdaJavaProxies.add(py_arg)
+                
+                # next few lines is from "isinstance(py_arg, PythonJavaClass)" above
+                # except jc is None is removed, as we know it has been called by
+                # convert_python_callable_to_jobject()
+
+                # from python class, get the proxy/python class
+                pc = py_arg
+                # get the java class
+                jc = pc.j_self
+
+                # get the localref
+                j_args[index].l = jc.j_self.obj
+
             else:
-                return -1
+                raise JavaException('Invalid python object for this '
+                        'argument. Want {0!r}, got {1!r}'.format(
+                            argtype[1:-1], py_arg))
 
-        if r == 'J':
-            if isinstance(arg, int) or isinstance(arg, long):
-                score += 10
+        elif argtype[0] == '[':
+            if py_arg is None:
+                j_args[index].l = NULL
                 continue
-            elif isinstance(arg, float):
-                score += 5
-                continue
-            else:
-                return -1
+            if isinstance(py_arg, str) and argtype == '[C':
+                py_arg = list(py_arg)
+            if isinstance(py_arg, ByteArray) and argtype != '[B':
+                raise JavaException(
+                    'Cannot use ByteArray for signature {}'.format(argtype))
+            if not isinstance(py_arg, (list, tuple, ByteArray, bytes, bytearray)):
+                raise JavaException('Expecting a python list/tuple, got '
+                        '{0!r}'.format(py_arg))
+            j_args[index].l = convert_pyarray_to_java(
+                    j_env, argtype[1:], py_arg)
 
-        if r == 'F' or r == 'D':
-            if isinstance(arg, int):
-                score += 5
-                continue
-            elif isinstance(arg, float):
-                score += 10
-                continue
-            else:
-                return -1
 
-        if r[0] == 'L':
+cdef convert_jobject_to_python(JNIEnv *j_env, definition, jobject j_object):
+    # ... código inalterado ...
 
-            r = r[1:-1]
+
+def get_signature(cls_tp):
+    # ... código inalterado ...
+
+
+def get_param_signature(m):
+    # ... código inalterado ...
+
+
+def convert_python_callable_to_jobject(definition, pyarg):
+    # ... código inalterado ...
+
+
+cdef jobject convert_python_to_jobject(JNIEnv *j_env, definition, obj) except *:
+    cdef jobject retobject, retsubobject
+    cdef jclass retclass
+    cdef jmethodID redmidinit = NULL
+    cdef jvalue j_ret[1]
+    cdef JavaClass jc
+    cdef JavaObject jo
+    cdef JavaClassStorage jcs
+    cdef PythonJavaClass pc
+    cdef int index
+
+    if definition[0] == 'V':
+        return NULL
+    elif definition[0] == 'L':
+        if obj is None:
+            return NULL
+
+        # string types
+        elif isinstance(obj, base_string) and jstringy_arg(definition):
+            return convert_pystr_to_java(j_env, to_unicode(obj))
+
+        # numeric types
+        elif isinstance(obj, int) and \
+                definition in (
+                    'Ljava/lang/Integer;',
+                    'Ljava/lang/Number;',
+                    'Ljava/lang/Long;',
+                    'Ljava/lang/Object;'):
+            j_ret[0].i = int(obj)
+            retclass = j_env[0].FindClass(j_env, 'java/lang/Integer')
+            retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(I)V')
+            retobject = j_env[0].NewObjectA(j_env, retclass, retmidinit, j_ret)
+            return retobject
+        elif isinstance(obj, float) and \
+                definition in (
+                    'Ljava/lang/Float;',
+                    'Ljava/lang/Number;',
+                    'Ljava/lang/Object;'):
+            j_ret[0].f = obj
+            retclass = j_env[0].FindClass(j_env, 'java/lang/Float')
+            retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(F)V')
+            retobject = j_env[0].NewObjectA(j_env, retclass, retmidinit, j_ret)
+            return retobject
+
+        # implementation of Java class in Python (needs j_cls)
+        elif isinstance(obj, type):
+            jc = obj
+            return jc.j_cls
+
+        # objects
+        elif isinstance(obj, JavaClass):
+            jc = obj
+            check_assignable_from(j_env, jc, definition[1:-1])
+            return jc.j_self.obj
+        elif isinstance(obj, JavaObject):
+            jo = obj
+            return jo.obj
+        elif isinstance(obj, MetaJavaClass):
+            jcs = getattr(obj, CLS_STORAGE_NAME)
+            return jcs.j_cls
+        elif isinstance(obj, PythonJavaClass):
+            # from python class, get the proxy/python class
+            pc = obj
+            # get the java class
+            jc = pc.j_self
+            if jc is None:
+                pc._init_j_self_ptr()
+                jc = pc.j_self
+            # get the localref
+            return jc.j_self.obj
+
+        # array
+        elif isinstance(obj, (tuple, list)):
+            return convert_pyarray_to_java(j_env, definition, obj)
+
+        else:
+            raise JavaException('Invalid python object for this '
+                    'argument. Want {0!r}, got {1!r}'.format(
+                        definition[1:-1], obj))
+
+    elif definition[0] == '[':
+        conversions = {
+            int: 'I',
+            bool: 'Z',
+            float: 'F',
+            unicode: 'Ljava/lang/String;',
+            bytes: 'B'
+        }
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Object')
+        retobject = j_env[0].NewObjectArray(j_env, len(obj), retclass, NULL)
+        for index, item in enumerate(obj):
+            item_definition = conversions.get(type(item), definition[1:])
+            retsubobject = convert_python_to_jobject(
+                    j_env, item_definition, item)
+            j_env[0].SetObjectArrayElement(j_env, retobject, index,
+                    retsubobject)
+            j_env[0].DeleteLocalRef(j_env, retsubobject)
+        return retobject
+
+    elif definition == 'B':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Byte')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(B)V')
+        j_ret[0].b = obj
+    elif definition == 'S':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Short')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(S)V')
+        j_ret[0].s = obj
+    elif definition == 'I':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Integer')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(I)V')
+        j_ret[0].i = int(obj)
+    elif definition == 'J':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Long')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(J)V')
+        j_ret[0].j = obj
+    elif definition == 'F':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Float')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(F)V')
+        j_ret[0].f = obj
+    elif definition == 'D':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Double')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(D)V')
+        j_ret[0].d = obj
+    elif definition == 'C':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Char')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(C)V')
+        j_ret[0].c = ord(obj)
+    elif definition == 'Z':
+        retclass = j_env[0].FindClass(j_env, 'java/lang/Boolean')
+        retmidinit = j_env[0].GetMethodID(j_env, retclass, '<init>', '(Z)V')
+        j_ret[0].z = 1 if obj else 0
+    else:
+        assert(0)
+
+    assert(retclass != NULL)
+    # XXX do we need a globalref or something ?
+    retobject = j_env[0].NewObjectA(j_env, retclass, retmidinit, j_ret)
+    return retobject
+
+cdef jstring convert_pystr_to_java(JNIEnv *j_env, unicode py_uni) except NULL:
+    # ... código inalterado ...
+
+
+cdef jobject convert_pyarray_to_java(JNIEnv *j_env, definition, pyarray) except *:
+    cdef jobject ret = NULL
+    cdef jobject nested = NULL
+    cdef int array_size = len(pyarray)
+    cdef int i
+    cdef unsigned char c_tmp
+    cdef jboolean j_boolean
+    cdef jbyte j_byte
+    cdef const_jbyte* j_bytes
+    cdef jchar j_char
+    cdef jshort j_short
+    cdef jint j_int
+    cdef jlong j_long
+    cdef jfloat j_float
+    cdef jdouble j_double
+    cdef jstring j_string
+    cdef jclass j_class
+    cdef JavaObject jo
+    cdef JavaClass jc
+
+    cdef ByteArray a_bytes
+
+    if definition == 'Ljava/lang/Object;' and len(pyarray) > 0:
+        # then the method will accept any array type as param
+        # let's be as precise as we can
+        conversions = {
+            int: 'I',
+            bool: 'Z',
+            float: 'F',
+            bytes: 'B',
+            str: 'Ljava/lang/String;',
+        }
+        for _type, override in conversions.items():
+            if isinstance(pyarray[0], _type):
+                definition = override
+                break
+
+    if definition == 'Z':
+        ret = j_env[0].NewBooleanArray(j_env, array_size)
+        for i in range(array_size):
+            j_boolean = 1 if pyarray[i] else 0
+            j_env[0].SetBooleanArrayRegion(j_env,
+                    ret, i, 1, &j_boolean)
+
+    elif definition == 'B':
+        ret = j_env[0].NewByteArray(j_env, array_size)
+        if isinstance(pyarray, ByteArray):
+            a_bytes = pyarray
+            j_env[0].SetByteArrayRegion(j_env,
+                ret, 0, array_size, <const_jbyte *>a_bytes._buf)
+        elif isinstance(pyarray, (bytearray, bytes)):
+            j_bytes = <signed char *>pyarray
+            j_env[0].SetByteArrayRegion(j_env,
+                ret, 0, array_size, j_bytes)
+        else:
+            for i in range(array_size):
+                c_tmp = pyarray[i]
+                j_byte = <signed char>c_tmp
+                j_env[0].SetByteArrayRegion(j_env,
+                        ret, i, 1, &j_byte)
+
+    elif definition == 'C':
+        ret = j_env[0].NewCharArray(j_env, array_size)
+        for i in range(array_size):
+            j_char = ord(pyarray[i])
+            j_env[0].SetCharArrayRegion(j_env,
+                    ret, i, 1, &j_char)
+
+    elif definition == 'S':
+        ret = j_env[0].NewShortArray(j_env, array_size)
+        for i in range(array_size):
+            j_short = pyarray[i]
+            j_env[0].SetShortArrayRegion(j_env,
+                    ret, i, 1, &j_short)
+
+    elif definition == 'I':
+        ret = j_env[0].NewIntArray(j_env, array_size)
+        for i in range(array_size):
+            j_int = pyarray[i]
+            j_env[0].SetIntArrayRegion(j_env,
+                    ret, i, 1, <const_jint *>&j_int)
+
+    elif definition == 'J':
+        ret = j_env[0].NewLongArray(j_env, array_size)
+        for i in range(array_size):
+            j_long = pyarray[i]
+            j_env[0].SetLongArrayRegion(j_env,
+                    ret, i, 1, &j_long)
+
+    elif definition == 'F':
+        ret = j_env[0].NewFloatArray(j_env, array_size)
+        for i in range(array_size):
+            j_float = pyarray[i]
+            j_env[0].SetFloatArrayRegion(j_env,
+                    ret, i, 1, &j_float)
+
+    elif definition == 'D':
+        ret = j_env[0].NewDoubleArray(j_env, array_size)
+        for i in range(array_size):
+            j_double = pyarray[i]
+            j_env[0].SetDoubleArrayRegion(j_env,
+                    ret, i, 1, &j_double)
+
+    elif definition[0] == 'L':
+        defstr = str_for_c(definition[1:-1])
+        j_class = j_env[0].FindClass(j_env, <bytes>defstr)
+
+        if j_class == NULL:
+            raise JavaException(
+                'Cannot create array with a class not '
+                'found {0!r}'.format(definition[1:-1])
+            )
+
+        ret = j_env[0].NewObjectArray(
+            j_env, array_size, j_class, NULL
+        )
+
+        # iterate over each Python array element
+        # and add it to Object[].
+        for i in range(array_size):
+            arg = pyarray[i]
 
             if arg is None:
-                score += 10
-                continue
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, NULL
+                )
 
-            # if it's a string, accept any python string
-            if r == 'java/lang/String' and isinstance(arg, str):
-                score += 10
-                continue
+            elif isinstance(arg, basestring):
+                j_string = convert_pystr_to_java(j_env, to_unicode(arg))
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, j_string
+                )
+                j_env[0].DeleteLocalRef(j_env, j_string)
 
-            # if it's a generic object, accept python string, or any java
-            # class/object
-            if r == 'java/lang/Object':
-                if isinstance(arg, (PythonJavaClass, JavaClass, JavaObject)):
-                    score += 10
-                    continue
-                elif isinstance(arg, base_string):
-                    score += 5
-                    continue
-                elif isinstance(arg, (list, tuple)):
-                    score += 5
-                    continue
-                elif isinstance(arg, int):
-                    score += 5
-                    continue
-                elif isinstance(arg, float):
-                    score += 5
-                    continue
-                return -1
+            # isinstance(arg, type) will return False
+            # ...and it's really weird
+            elif isinstance(arg, (tuple, list)):
+                nested = convert_pyarray_to_java(
+                    j_env, definition, arg
+                )
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, nested
+                )
+                j_env[0].DeleteLocalRef(j_env, nested)
 
-            # accept an autoclass class for java/lang/Class.
-            if hasattr(arg, '__javaclass__') and r == 'java/lang/Class':
-                score += 10
-                continue
-
-            # if we pass a JavaClass, ensure the definition is matching
-            # XXX FIXME what if we use a subclass or something ?
-            if isinstance(arg, JavaClass):
+            # no local refs to delete for class, type and object
+            elif isinstance(arg, JavaClass):
                 jc = arg
-                if jc.__javaclass__ == r:
-                    score += 10
-                else:
-                    #try:
-                    #    check_assignable_from(jc, r)
-                    #except:
-                    #    return -1
-                    score += 5
-                continue
+                check_assignable_from(j_env, jc, definition[1:-1])
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, jc.j_self.obj
+                )
 
-            # always accept unknow object, but can be dangerous too.
-            if isinstance(arg, JavaObject):
-                score += 1
-                continue
+            elif isinstance(arg, type):
+                jc = arg
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, jc.j_cls
+                )
 
-            if isinstance(arg, PythonJavaClass):
-                score += 1
-                continue
+            elif isinstance(arg, JavaObject):
+                jo = arg
+                j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, i, jo.obj
+                )
 
-            # its a function or lambda, we can pass that as an object
-            if callable(arg):
-                score += 1
-                continue
+            else:
+                raise JavaException(
+                    'Invalid variable {!r} used for L array {!r}'.format(
+                        pyarray, definition
+                    )
+                )
 
-            # native type? not accepted
-            return -1
+    elif definition[0] == '[':
+        subdef = definition[1:]
+        eproto = convert_pyarray_to_java(j_env, subdef, pyarray[0])
+        ret = j_env[0].NewObjectArray(
+                j_env, array_size, j_env[0].GetObjectClass(j_env, eproto), NULL)
+        j_env[0].SetObjectArrayElement(
+                    j_env, <jobjectArray>ret, 0, eproto)
+        j_env[0].DeleteLocalRef(j_env, eproto)
+        for i in range(1, array_size):
+            j_elem = convert_pyarray_to_java(j_env, subdef, pyarray[i])
+            j_env[0].SetObjectArrayElement(j_env, <jobjectArray>ret, i, j_elem)
+            j_env[0].DeleteLocalRef(j_env, j_elem)
 
-        if r[0] == '[':
+    else:
+        raise JavaException(
+            'Invalid array definition {!r} for variable {!r}'.format(
+                definition, pyarray
+            )
+        )
 
-            if arg is None:
-                score += 10
-                continue
-
-            if (r == '[B') and isinstance(arg, bytes):
-                score += 10
-                continue
-
-            if (r == '[C') and isinstance(arg, str):
-                score += 10
-                continue
-
-            if r == '[B' and isinstance(arg, (bytearray, ByteArray)):
-                score += 10
-                continue
-
-            if not isinstance(arg, (list, tuple)):
-                return -1
-
-            # calculate the score for our subarray
-            if len(arg) > 0:
-                # if there are supplemantal arguments we compute the score
-                subscore = calculate_score([r[1:]] * len(arg), arg)
-                if subscore == -1:
-                    return -1
-                # the supplemental arguments match the varargs arguments
-                score += 10
-                continue
-            # else if there is no supplemental arguments
-            # it might be the good method but there may be
-            # a method with a better signature so we don't
-            # change this method score
-    return score
-
-
-cdef readable_sig(sig, is_var):
-    """
-    Converts JNI signature to easily readable signature.
-    :param sig: JNI signature string
-    :param is_var: if the function has varargs
-    :return:([arg], rtn)
-    """
-    dic = {'Z': 'boolean',
-           'B': 'byte',
-           'C': 'char',
-           'D': 'double',
-           'F': 'float',
-           'I': 'int',
-           'J': 'long',
-           'S': 'short',
-           'V': 'void',
-           '[': 'array',
-           'L': 'fqs'}
-
-    splt = sig.split(')')
-    # remove first '('
-    args_str = splt[0][1:]
-    args = []
-    is_array = False
-    i = 0
-    while i < len(args_str):
-        c = args_str[i]
-        type_ = dic[c]
-        if type_ == 'array':
-            is_array = True
-            i += 1
-        elif type_ == 'fqs':
-            cls_n = ''
-            for fqs_i in range(i+1, len(args_str)):
-                if args_str[fqs_i] == ';':
-                    i = fqs_i + 1
-                    break
-                else:
-                    cls_n += args_str[fqs_i]
-            args.append(cls_n + '[]' if is_array else cls_n)
-            is_array = False
-        else:
-            args.append(dic[c] + '[]' if is_array else dic[c])
-            is_array = False
-            i += 1
-
-    # last element of args is array and function has Varargs
-    if len(args) > 0 and args[-1][-2:] == '[]' and is_var:
-        args[-1] = args[-1][:-2] + '...'
-
-    rtn_str = splt[1]
-    rtn = ''
-    i = 0
-    is_array = False
-    while i < len(rtn_str):
-        c = rtn_str[i]
-        type_ = dic[c]
-        if type_ == 'array':
-            is_array = True
-            i += 1
-        elif type_ == 'fqs':
-            cls_n = ''
-            for fqs_i in range(i + 1, len(rtn_str)):
-                if rtn_str[fqs_i] == ';':
-                    i = fqs_i + 1
-                    break
-                else:
-                    cls_n += rtn_str[fqs_i]
-            rtn = cls_n + '[]' if is_array else cls_n
-        else:
-            rtn = dic[c] + '[]' if is_array else dic[c]
-            i += 1
-
-    return args, rtn
+    return <jobject>ret
